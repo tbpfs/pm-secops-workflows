@@ -1,0 +1,69 @@
+name: Weekly Live Ecosystem Security & Header Audit
+
+on:
+  schedule:
+    - cron: "17 22 * * 0" # 每週一 06:17 (Asia/Taipei)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-live-domains:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Audit 10 Production Domains (HTTPS, HSTS, nosniff, Source Leak Block)
+        run: |
+          python3 - <<'PY'
+          import sys, urllib.request, urllib.error
+
+          DOMAINS = [
+              ("https://ai-purplemaple.com", True, True),
+              ("https://learn.ai-purplemaple.com", True, False),
+              ("https://game.ai-purplemaple.com", True, True),
+              ("https://fps.ai-purplemaple.com", True, True),
+              ("https://quote.ai-purplemaple.com", True, True),
+              ("https://edu.ai-purplemaple.com", True, True),
+              ("https://muse.ai-purplemaple.com", True, True),
+              ("https://waifu.ai-purplemaple.com", True, True),
+              ("https://astral.ai-purplemaple.com", True, True),
+              ("https://hub.ai-purplemaple.com", True, True),
+          ]
+          ua = {"User-Agent": "PurpleMaple-WeeklySecOpsAudit/1.0"}
+          failures = []
+
+          for base, require_hsts, check_py in DOMAINS:
+              target = base + ("/api/health" if "hub." in base else "/")
+              try:
+                  req = urllib.request.Request(target, headers=ua)
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      hdrs = {k.lower(): v for k, v in resp.headers.items()}
+                      if resp.status != 200:
+                          failures.append(f"{target}: HTTP {resp.status}")
+                      if require_hsts and "strict-transport-security" not in hdrs:
+                          failures.append(f"{target}: missing Strict-Transport-Security")
+                      if require_hsts and hdrs.get("x-content-type-options", "").lower() != "nosniff":
+                          failures.append(f"{target}: missing X-Content-Type-Options: nosniff")
+                      print(f"[OK] {target} -> 200 (HSTS={'yes' if 'strict-transport-security' in hdrs else 'no'})")
+              except Exception as exc:
+                  failures.append(f"{target}: {exc}")
+
+              if check_py:
+                  for probe in ("/server.py", "/.env", "/Dockerfile"):
+                      try:
+                          preq = urllib.request.Request(base + probe, headers=ua)
+                          with urllib.request.urlopen(preq, timeout=15) as presp:
+                              failures.append(f"{base}{probe}: EXPOSED HTTP {presp.status}!")
+                      except urllib.error.HTTPError as he:
+                          if he.code not in (401, 403, 404):
+                              failures.append(f"{base}{probe}: unexpected HTTP {he.code}")
+                      except Exception as exc:
+                          failures.append(f"{base}{probe}: {exc}")
+
+          if failures:
+              for f in failures:
+                  print(f"::error::{f}", file=sys.stderr)
+              sys.exit(1)
+          print("[ALL 10 DOMAINS SECURE] HSTS, nosniff & sensitive file blocks verified.")
+          PY

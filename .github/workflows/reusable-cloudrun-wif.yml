@@ -1,0 +1,112 @@
+name: Reusable Keyless WIF Cloud Run Deploy & Post-Deploy Smoke
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Cloud Run 服務名稱"
+        required: true
+        type: string
+      region:
+        description: "Cloud Run 部署區域"
+        required: false
+        type: string
+        default: "asia-east1"
+      runtime_service_account:
+        description: "容器執行階段最小權限 Service Account"
+        required: true
+        type: string
+      max_instances:
+        description: "最大自動擴展實例數上限 (防帳單型 DDoS)"
+        required: false
+        type: number
+        default: 6
+      live_domain_url:
+        description: "部署後線上安全標頭與健康度驗收網址 (如 https://fps.ai-purplemaple.com)"
+        required: false
+        type: string
+        default: ""
+      check_public_headers:
+        description: "是否強制檢查 Cloudflare HSTS 與 X-Content-Type-Options: nosniff"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy-and-verify:
+    name: WIF Keyless Deploy & Live Header Verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Authenticate to Google Cloud via Keyless OIDC (WIF)
+        if: ${{ vars.GCP_WIF_PROVIDER != '' && vars.GCP_SA_EMAIL != '' && vars.GCP_PROJECT_ID != '' }}
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+
+      - name: Set up Google Cloud SDK
+        if: ${{ vars.GCP_WIF_PROVIDER != '' && vars.GCP_SA_EMAIL != '' && vars.GCP_PROJECT_ID != '' }}
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Deploy to Cloud Run with Least-Privilege SA & MaxScale Cap
+        if: ${{ vars.GCP_WIF_PROVIDER != '' && vars.GCP_SA_EMAIL != '' && vars.GCP_PROJECT_ID != '' }}
+        env:
+          SVC_NAME: ${{ inputs.service_name }}
+          SVC_REGION: ${{ inputs.region }}
+          PROJ_ID: ${{ vars.GCP_PROJECT_ID }}
+          RUNTIME_SA: ${{ inputs.runtime_service_account }}
+          MAX_INST: ${{ inputs.max_instances }}
+        run: |
+          gcloud run deploy "${SVC_NAME}" \
+            --source . \
+            --region "${SVC_REGION}" \
+            --project "${PROJ_ID}" \
+            --service-account="${RUNTIME_SA}" \
+            --max-instances="${MAX_INST}" \
+            --allow-unauthenticated \
+            --quiet
+
+      - name: Stage 5 — Post-Deploy Live Security Headers & /server.py Block Check
+        if: ${{ inputs.live_domain_url != '' }}
+        env:
+          LIVE_URL: ${{ inputs.live_domain_url }}
+          CHK_HDRS: ${{ inputs.check_public_headers && '1' || '0' }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, urllib.request, urllib.error
+
+          base = os.environ["LIVE_URL"].rstrip("/")
+          chk_hdrs = os.environ["CHK_HDRS"] == "1"
+          ua = {"User-Agent": "PurpleMaple-PostDeploySecAudit/1.0"}
+
+          req = urllib.request.Request(base + "/", headers=ua)
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              if resp.status != 200:
+                  sys.exit(f"Expected 200 on {base}/, got {resp.status}")
+              hdrs = {k.lower(): v for k, v in resp.headers.items()}
+              if chk_hdrs:
+                  if "strict-transport-security" not in hdrs:
+                      sys.exit(f"Missing Strict-Transport-Security header on {base}/")
+                  if hdrs.get("x-content-type-options", "").lower() != "nosniff":
+                      sys.exit(f"Missing X-Content-Type-Options: nosniff on {base}/")
+
+          for p in ("/server.py", "/.env", "/Dockerfile"):
+              breq = urllib.request.Request(base + p, headers=ua)
+              try:
+                  with urllib.request.urlopen(breq, timeout=15) as bresp:
+                      sys.exit(f"CRITICAL: {base}{p} returned HTTP {bresp.status}!")
+              except urllib.error.HTTPError as e:
+                  if e.code not in (401, 403, 404):
+                      sys.exit(f"Unexpected status {e.code} on {base}{p}")
+          print(f"[POST-DEPLOY PASS] {base}: HTTP 200 + HSTS/nosniff + sensitive files blocked.")
+          PY

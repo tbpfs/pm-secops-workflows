@@ -1,0 +1,152 @@
+name: Reusable DevSecOps Security Gate
+
+on:
+  workflow_call:
+    inputs:
+      python_sast:
+        description: "執行 Python 語法與 Bandit 靜態安全掃描"
+        required: false
+        type: boolean
+        default: true
+      node_audit:
+        description: "執行 Node.js npm audit 供應鏈高危弱點掃描"
+        required: false
+        type: boolean
+        default: false
+      node_working_dir:
+        description: "Node.js package-lock.json 所在子目錄"
+        required: false
+        type: string
+        default: "."
+      public_repo:
+        description: "是否為公開儲存庫"
+        required: false
+        type: boolean
+        default: false
+      public_web_gate:
+        description: "是否驗證公開網站 SEO/ads.txt 契約"
+        required: false
+        type: boolean
+        default: false
+      large_file_allowlist:
+        description: "允許超過 5MB 之檔案路徑（逗號分隔）"
+        required: false
+        type: string
+        default: ""
+      test_command:
+        description: "專案自動化測試指令"
+        required: false
+        type: string
+        default: ""
+      docker_scan:
+        description: "是否建置 Dockerfile 並執行 Trivy HIGH/CRITICAL 掃描與敏感路徑暴露黑盒測試"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  secops-gate:
+    name: DevSecOps SAST / SCA / Secret & Container Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: caller
+
+      - name: Checkout shared secops scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tbpfs/pm-secops-workflows
+          path: _secops
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 24 (when needed)
+        if: ${{ inputs.node_audit || contains(inputs.test_command, 'npm') || contains(inputs.test_command, 'node') }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+
+      - name: Stage 1 — Secret, Path Leak & Workflow Supply-Chain Gate
+        env:
+          IS_PUB_REPO: ${{ inputs.public_repo && '1' || '0' }}
+          IS_PUB_WEB: ${{ inputs.public_web_gate && '1' || '0' }}
+          ALLOW_LARGE: ${{ inputs.large_file_allowlist }}
+        run: |
+          EXTRA_FLAGS=()
+          if [[ "${IS_PUB_REPO}" == "1" ]]; then EXTRA_FLAGS+=("--public-repo"); fi
+          if [[ "${IS_PUB_WEB}" == "1" ]]; then EXTRA_FLAGS+=("--public-web"); fi
+          python3 _secops/scripts/pm_secops_gate.py \
+            --repo-dir caller \
+            --allow-large "${ALLOW_LARGE}" \
+            "${EXTRA_FLAGS[@]}"
+
+      - name: Stage 2a — Python SAST (Bandit High-Severity Check)
+        if: ${{ inputs.python_sast }}
+        run: |
+          PY_FILES=$(git -C caller ls-files '*.py' || true)
+          if [[ -n "${PY_FILES}" ]]; then
+            pip install --quiet --disable-pip-version-check "bandit>=1.7.10"
+            # Fail on HIGH severity + HIGH confidence issues (e.g. shell=True injection, weak crypto, unverified TLS)
+            bandit -r caller -x caller/tests,caller/test,caller/.venv,caller/node_modules -lll -iii -q
+            echo "[PASS] Python Bandit SAST check clean."
+          fi
+
+      - name: Stage 2b — Node.js Dependency Vulnerability Audit
+        if: ${{ inputs.node_audit }}
+        working-directory: caller/${{ inputs.node_working_dir }}
+        run: |
+          if [[ -f package-lock.json ]]; then
+            npm ci --no-audit --no-fund
+            npm audit --omit=dev --audit-level=critical
+            echo "[PASS] npm production dependency audit clean."
+          fi
+
+      - name: Stage 3a — Run Project Verification / Unit Test Suite
+        if: ${{ inputs.test_command != '' }}
+        working-directory: caller
+        env:
+          TEST_CMD: ${{ inputs.test_command }}
+        run: |
+          bash -euo pipefail -c "${TEST_CMD}"
+
+      - name: Stage 3b — Build Container & Verify Zero Source-Code Exposure
+        if: ${{ inputs.docker_scan }}
+        working-directory: caller
+        run: |
+          docker build -t secops-candidate:scan .
+          docker run -d --name secops-probe -p 18080:8080 -e PORT=8080 secops-candidate:scan
+          for _ in 1 2 3 4 5 6; do
+            CODE_ROOT=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/ || true)
+            if [[ "${CODE_ROOT}" != "000" ]]; then break; fi
+            sleep 1
+          done
+          for SENSITIVE in "/server.py" "/.env" "/Dockerfile"; do
+            SCODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${SENSITIVE}" || true)
+            if [[ "${SCODE}" == "200" ]]; then
+              docker rm -f secops-probe
+              echo "::error::容器安全檢測失敗：敏感路徑 ${SENSITIVE} 對外回傳 HTTP 200！"
+              exit 1
+            fi
+          done
+          docker rm -f secops-probe
+          echo "[PASS] Container runtime probe passed (/server.py, /.env, /Dockerfile blocked)."
+
+      - name: Stage 3c — Aqua Trivy Container Vulnerability Scan
+        if: ${{ inputs.docker_scan }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "secops-candidate:scan"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "library"
+          severity: "CRITICAL"
