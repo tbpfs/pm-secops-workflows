@@ -121,6 +121,9 @@ jobs:
             if ! command -v ffmpeg >/dev/null 2>&1; then
               sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
             fi
+            if [[ -f requirements.txt ]]; then
+              pip install --quiet --disable-pip-version-check -r requirements.txt
+            fi
             bash -euo pipefail -c "${TEST_CMD}"
           fi
           if [[ "${IS_PUB_WEB}" == "1" ]]; then
