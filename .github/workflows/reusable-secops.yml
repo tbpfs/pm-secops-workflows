@@ -78,12 +78,10 @@ jobs:
       - name: Stage 1 — Secret, Path Leak & Workflow Supply-Chain Gate
         env:
           IS_PUB_REPO: ${{ inputs.public_repo && '1' || '0' }}
-          IS_PUB_WEB: ${{ inputs.public_web_gate && '1' || '0' }}
           ALLOW_LARGE: ${{ inputs.large_file_allowlist }}
         run: |
           EXTRA_FLAGS=()
           if [[ "${IS_PUB_REPO}" == "1" ]]; then EXTRA_FLAGS+=("--public-repo"); fi
-          if [[ "${IS_PUB_WEB}" == "1" ]]; then EXTRA_FLAGS+=("--public-web"); fi
           python3 _secops/scripts/pm_secops_gate.py \
             --repo-dir caller \
             --allow-large "${ALLOW_LARGE}" \
@@ -110,13 +108,29 @@ jobs:
             echo "[PASS] npm production dependency audit clean."
           fi
 
-      - name: Stage 3a — Run Project Verification / Unit Test Suite
-        if: ${{ inputs.test_command != '' }}
+      - name: Stage 3a — Run Project Verification / Unit Test Suite & Post-Build Web Contract
+        if: ${{ inputs.test_command != '' || inputs.public_web_gate }}
         working-directory: caller
         env:
           TEST_CMD: ${{ inputs.test_command }}
+          IS_PUB_WEB: ${{ inputs.public_web_gate && '1' || '0' }}
+          IS_PUB_REPO: ${{ inputs.public_repo && '1' || '0' }}
+          ALLOW_LARGE: ${{ inputs.large_file_allowlist }}
         run: |
-          bash -euo pipefail -c "${TEST_CMD}"
+          if [[ -n "${TEST_CMD}" ]]; then
+            if ! command -v ffmpeg >/dev/null 2>&1; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+            fi
+            bash -euo pipefail -c "${TEST_CMD}"
+          fi
+          if [[ "${IS_PUB_WEB}" == "1" ]]; then
+            EXTRA_WEB=("--public-web")
+            if [[ "${IS_PUB_REPO}" == "1" ]]; then EXTRA_WEB+=("--public-repo"); fi
+            python3 ../_secops/scripts/pm_secops_gate.py \
+              --repo-dir . \
+              --allow-large "${ALLOW_LARGE}" \
+              "${EXTRA_WEB[@]}"
+          fi
 
       - name: Stage 3b — Build Container & Verify Zero Source-Code Exposure
         if: ${{ inputs.docker_scan }}

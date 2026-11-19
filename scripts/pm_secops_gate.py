@@ -48,8 +48,8 @@ FORBIDDEN_FILE_RE = re.compile(
 )
 
 EXEMPT_PATH_SCAN_RE = re.compile(
-    r"(^|/)(tests?|scripts|docs|\.github|\.agents)/"
-    r"|(^|/)(GEMINI|AGENTS|CHANGELOG|PLAN)\.md$"
+    r"(^|/)(tests?|fixtures|scripts|docs|\.github|\.agents)/"
+    r"|(^|/)(GEMINI|AGENTS|README|CHANGELOG|PLAN)\.md$"
     r"|\.(spec|test)\.[jt]s$"
     r"|audit\.m?[jt]s$",
     re.IGNORECASE,
