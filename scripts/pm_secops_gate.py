@@ -28,6 +28,7 @@ SECRET_RE = re.compile(
     r"|cfat_[A-Za-z0-9_]{20,}"
     r"|xai-[A-Za-z0-9]{20,}"
     r"|sk-[A-Za-z0-9_-]{20,}"
+    r"|AIza[0-9A-Za-z_-]{35}"
     r"|GOCSPX-[A-Za-z0-9_-]{20,}"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
     r"|AKIA[0-9A-Z]{16})"
@@ -41,7 +42,7 @@ LOCAL_PATH_RE = re.compile(
 FORBIDDEN_FILE_RE = re.compile(
     r"(^|/)\.env($|\.(?!example$))"
     r"|\.(pem|key|p12|pfx|token|safetensors|ckpt|pt|pth|onnx)$"
-    r"|(^|/)[^/]*(service_account|user_oauth|client_secret|credentials|token)[^/]*\.(json|db)$"
+    r"|(^|/)[^/]*(service_account|user_oauth|client_secret|credentials|secrets|token)[^/]*\.(json|db|ya?ml)$"
     r"|(^|/)[^/]*(api_token|_token|cookies)[^/]*\.txt$"
     r"|(^|/)id_(rsa|ed25519|ecdsa)$",
     re.IGNORECASE,
