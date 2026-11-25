@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Audit 10 Production Domains (HTTPS, HSTS, nosniff, Source Leak Block)
+      - name: Audit 15 Production Domains (HTTPS, HSTS, nosniff, Hub SSO, Source Leak Block)
         run: |
           python3 - <<'PY'
-          import sys, urllib.request, urllib.error
+          import json, sys, urllib.request, urllib.error
 
           DOMAINS = [
               ("https://ai-purplemaple.com", True, True),
@@ -28,16 +28,31 @@ jobs:
               ("https://muse.ai-purplemaple.com", True, True),
               ("https://waifu.ai-purplemaple.com", True, True),
               ("https://astral.ai-purplemaple.com", True, True),
+              ("https://invest.ai-purplemaple.com", True, True),
+              ("https://novel.ai-purplemaple.com", True, True),
+              ("https://frame.ai-purplemaple.com", True, True),
+              ("https://margin.ai-purplemaple.com", True, True),
+              ("https://radar.ai-purplemaple.com", True, True),
               ("https://hub.ai-purplemaple.com", True, True),
           ]
-          ua = {"User-Agent": "PurpleMaple-WeeklySecOpsAudit/1.0"}
+          PROBES = (
+              "/server.py",
+              "/.env",
+              "/Dockerfile",
+              "/.claude/settings.json",
+              "/.aws/credentials",
+              "/secrets.json",
+          )
+          ua = {"User-Agent": "PurpleMaple-WeeklySecOpsAudit/1.1"}
           failures = []
 
           for base, require_hsts, check_py in DOMAINS:
-              target = base + ("/api/health" if "hub." in base else "/")
+              is_hub = "hub." in base
+              target = base + ("/api/health" if is_hub else "/")
               try:
                   req = urllib.request.Request(target, headers=ua)
                   with urllib.request.urlopen(req, timeout=20) as resp:
+                      body = resp.read(4096).decode("utf-8", errors="replace")
                       hdrs = {k.lower(): v for k, v in resp.headers.items()}
                       if resp.status != 200:
                           failures.append(f"{target}: HTTP {resp.status}")
@@ -45,18 +60,22 @@ jobs:
                           failures.append(f"{target}: missing Strict-Transport-Security")
                       if require_hsts and hdrs.get("x-content-type-options", "").lower() != "nosniff":
                           failures.append(f"{target}: missing X-Content-Type-Options: nosniff")
+                      if is_hub:
+                          health = json.loads(body)
+                          if not health.get("google_sso_configured"):
+                              failures.append(f"{target}: google_sso_configured is False (possible Fail-Closed vault loss)")
                       print(f"[OK] {target} -> 200 (HSTS={'yes' if 'strict-transport-security' in hdrs else 'no'})")
               except Exception as exc:
                   failures.append(f"{target}: {exc}")
 
               if check_py:
-                  for probe in ("/server.py", "/.env", "/Dockerfile"):
+                  for probe in PROBES:
                       try:
                           preq = urllib.request.Request(base + probe, headers=ua)
                           with urllib.request.urlopen(preq, timeout=15) as presp:
                               failures.append(f"{base}{probe}: EXPOSED HTTP {presp.status}!")
                       except urllib.error.HTTPError as he:
-                          if he.code not in (401, 403, 404):
+                          if he.code not in (401, 403, 404, 429):
                               failures.append(f"{base}{probe}: unexpected HTTP {he.code}")
                       except Exception as exc:
                           failures.append(f"{base}{probe}: {exc}")
@@ -65,5 +84,5 @@ jobs:
               for f in failures:
                   print(f"::error::{f}", file=sys.stderr)
               sys.exit(1)
-          print("[ALL 10 DOMAINS SECURE] HSTS, nosniff & sensitive file blocks verified.")
+          print(f"[ALL {len(DOMAINS)} DOMAINS SECURE] HSTS, nosniff, Hub SSO & {len(PROBES)} sensitive probes verified.")
           PY
