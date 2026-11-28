@@ -233,12 +233,13 @@ jobs:
               docker logs secops-probe || true
               exit 1
             fi
-            CODE_ROOT=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${DOCKER_PROBE_PATH}" || echo "000")
+            CODE_ROOT=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${DOCKER_PROBE_PATH}" || true)
+            CODE_ROOT="${CODE_ROOT:-000}"
             if [[ "${CODE_ROOT}" != "000" ]]; then break; fi
             sleep 1
           done
 
-          if [[ "${CODE_ROOT}" == "000" || "${CODE_ROOT}" =~ ^5[0-9]{2}$ ]]; then
+          if [[ ! "${CODE_ROOT}" =~ ^[1-4][0-9]{2}$ ]]; then
             echo "::error::容器安全檢測失敗：探測 ${DOCKER_PROBE_PATH} 回傳異常狀態碼 HTTP ${CODE_ROOT}！"
             docker logs secops-probe || true
             exit 1
@@ -250,8 +251,9 @@ jobs:
           fi
 
           for SENSITIVE in "${SENSITIVE_PATHS[@]}"; do
-            SCODE=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${SENSITIVE}" || echo "000")
-            if [[ "${SCODE}" == "200" || "${SCODE}" == "000" || "${SCODE}" =~ ^5[0-9]{2}$ ]]; then
+            SCODE=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${SENSITIVE}" || true)
+            SCODE="${SCODE:-000}"
+            if [[ "${SCODE}" == "200" || ! "${SCODE}" =~ ^[1-4][0-9]{2}$ ]]; then
               echo "::error::容器安全檢測失敗：敏感路徑 ${SENSITIVE} 回傳非預期狀態碼 HTTP ${SCODE}！"
               docker logs secops-probe || true
               exit 1

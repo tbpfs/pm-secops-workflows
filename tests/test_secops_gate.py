@@ -71,10 +71,11 @@ class TestSecOpsGate(unittest.TestCase):
             "ENV_ITEM_RE='^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@+-]*$'",
             "trap 'docker rm -f secops-probe",
             "State.Running",
-            "^5[0-9]{2}$",
+            "^[1-4][0-9]{2}$",
             "library CRITICAL",
         ):
             self.assertIn(needle, txt, f"Missing expected contract in reusable-secops.yml: {needle}")
+        self.assertNotIn('|| echo "000"', txt, "Never append echo 000 after curl -w %{http_code} (produces 000000)")
 
         # Verify extracted bash scripts in reusable-secops.yml pass `bash -n` when bash is available
         bash_bin = shutil.which("bash")
