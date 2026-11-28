@@ -26,6 +26,7 @@ SECRET_RE = re.compile(
     r"|github_pat_[A-Za-z0-9_]{30,}"
     r"|cfut_[A-Za-z0-9_]{20,}"
     r"|cfat_[A-Za-z0-9_]{20,}"
+    r"|cfk_[A-Za-z0-9_]{20,}"
     r"|xai-[A-Za-z0-9]{20,}"
     r"|sk-[A-Za-z0-9_-]{20,}"
     r"|AIza[0-9A-Za-z_-]{35}"
@@ -61,9 +62,116 @@ TEXT_EXTS = {
 }
 
 USES_LINE_RE = re.compile(r"^\s*-?\s*uses:\s*([^\s#]+)", re.MULTILINE)
-UNSAFE_EXPR_IN_RUN_RE = re.compile(
-    r"\$\{\{\s*(?:github\.event\.(?:issue|pull_request|comment|commits|head_commit|discussion)|inputs\.)[^}]*\}\}"
+GHA_EXPR_RE = re.compile(r"\$\{\{([\s\S]*?)\}\}")
+UNSAFE_EXPR_BODY_RE = re.compile(
+    r"\b(?:github\.head_ref"
+    r"|github\.event\.(?:issue|pull_request|comment|commits|head_commit|discussion"
+    r"|review|review_comment|pages|workflow_run|release|inputs|client_payload)"
+    r"|inputs\.)"
 )
+UNSAFE_EXPR_IN_RUN_RE = re.compile(
+    r"\$\{\{(?:(?!\}\}).)*\b(?:github\.head_ref"
+    r"|github\.event\.(?:issue|pull_request|comment|commits|head_commit|discussion"
+    r"|review|review_comment|pages|workflow_run|release|inputs|client_payload)"
+    r"|inputs\.)(?:(?!\}\}).)*\}\}"
+)
+RUN_KEY_RE = re.compile(r"^(\s*(?:-\s+)?)run:\s*(.*)$")
+BLOCK_SCALAR_HDR_RE = re.compile(r"^[|>](?:[+-][1-9]|[1-9][+-]|[+-]|[1-9])?\s*(?:#.*)?$")
+EMPTY_OR_COMMENT_RE = re.compile(r"^(?:#.*)?$")
+
+
+def _is_quoted_closed(fragment: str, quote: str, start_idx: int = 0) -> bool:
+    i = start_idx
+    n = len(fragment)
+    if quote == '"':
+        while i < n:
+            ch = fragment[i]
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                return True
+            i += 1
+        return False
+    while i < n:
+        if fragment[i] == "'":
+            if i + 1 < n and fragment[i + 1] == "'":
+                i += 2
+                continue
+            return True
+        i += 1
+    return False
+
+
+def extract_run_script_lines(yaml_text: str) -> list[tuple[int, str]]:
+    """Zero-dependency indentation-aware extractor returning (1-based line_no, script_text) strictly inside `run:`."""
+    collected: list[tuple[int, str]] = []
+    mode: str | None = None
+    key_indent = -1
+
+    for line_no, raw_line in enumerate(yaml_text.splitlines(), 1):
+        stripped = raw_line.strip()
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+
+        if mode == "block":
+            if not stripped:
+                continue
+            if indent > key_indent:
+                collected.append((line_no, raw_line))
+                continue
+            mode = None
+        elif mode == "quoted_double":
+            if stripped and indent <= key_indent:
+                mode = None
+            else:
+                collected.append((line_no, raw_line))
+                if _is_quoted_closed(raw_line, '"', 0):
+                    mode = None
+                continue
+        elif mode == "quoted_single":
+            if stripped and indent <= key_indent:
+                mode = None
+            else:
+                collected.append((line_no, raw_line))
+                if _is_quoted_closed(raw_line, "'", 0):
+                    mode = None
+                continue
+        elif mode == "plain_cont":
+            if not stripped:
+                continue
+            if indent > key_indent and not re.match(r"^\s*-\s+", raw_line):
+                collected.append((line_no, raw_line))
+                continue
+            mode = None
+
+        if not stripped or raw_line.lstrip().startswith("#"):
+            continue
+        m = RUN_KEY_RE.match(raw_line)
+        if not m:
+            continue
+        # key_indent is the literal starting column of `run:` (counting leading `- ` on list items)
+        key_indent = len(m.group(1))
+        val = m.group(2)
+        val_stripped = val.strip()
+        if BLOCK_SCALAR_HDR_RE.match(val_stripped) or EMPTY_OR_COMMENT_RE.match(val_stripped):
+            mode = "block"
+        elif val_stripped.startswith('"'):
+            collected.append((line_no, val))
+            if not _is_quoted_closed(val_stripped, '"', 1):
+                mode = "quoted_double"
+        elif val_stripped.startswith("'"):
+            collected.append((line_no, val))
+            if not _is_quoted_closed(val_stripped, "'", 1):
+                mode = "quoted_single"
+        else:
+            collected.append((line_no, val))
+            mode = "plain_cont"
+
+    return collected
+
+
+def has_unsafe_run_expression(script_line: str) -> bool:
+    return any(UNSAFE_EXPR_BODY_RE.search(m.group(1)) for m in GHA_EXPR_RE.finditer(script_line))
 
 
 def list_tracked_files(repo_dir: Path) -> list[str]:
@@ -95,6 +203,11 @@ def audit_workflows(repo_dir: Path) -> list[str]:
             # Local reusable workflow repo may be referenced via @main or @v1 tag by callers; third-party actions must pin 40-char SHA
             if not repo_part.startswith("tbpfs/") and not re.fullmatch(r"[0-9a-f]{40}", ver):
                 warnings_or_errors.append(f"[Workflow 供應鏈] {rel}: 第三方 Action `{ref}` 未釘選 40 字元 Commit SHA")
+        for line_no, script_line in extract_run_script_lines(txt):
+            if has_unsafe_run_expression(script_line):
+                warnings_or_errors.append(
+                    f"[Workflow 注入風險] {rel}:{line_no}: run: 區段不得直接內插不可信運算式，請改透過 env: 傳遞"
+                )
     return warnings_or_errors
 
 

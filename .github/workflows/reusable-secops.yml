@@ -44,10 +44,25 @@ on:
         type: boolean
         default: false
       docker_scan:
-        description: "是否建置 Dockerfile 並執行 Trivy HIGH/CRITICAL 掃描與敏感路徑暴露黑盒測試"
+        description: "是否建置 Dockerfile 並執行 Trivy library CRITICAL 套件弱點掃描與容器啟動／敏感路徑暴露黑盒測試"
         required: false
         type: boolean
         default: false
+      docker_run_env:
+        description: "Stage 3b 離線容器探測用測試環境變數（逗號分隔 KEY=VALUE，嚴禁傳真實機密）"
+        required: false
+        type: string
+        default: ""
+      docker_probe_path:
+        description: "Stage 3b 容器啟動健康探測路徑（預設 /；自訂路徑如 /api/health 時嚴格要求 HTTP 200）"
+        required: false
+        type: string
+        default: "/"
+      docker_sensitive_paths:
+        description: "Stage 3b 禁止對外暴露的敏感路徑清單（逗號分隔）"
+        required: false
+        type: string
+        default: "/server.py,/.env,/Dockerfile"
 
 permissions:
   contents: read
@@ -164,24 +179,85 @@ jobs:
       - name: Stage 3b — Build Container & Verify Zero Source-Code Exposure
         if: ${{ inputs.docker_scan }}
         working-directory: caller
+        env:
+          DOCKER_RUN_ENV: ${{ inputs.docker_run_env }}
+          DOCKER_PROBE_PATH: ${{ inputs.docker_probe_path }}
+          DOCKER_SENSITIVE_PATHS: ${{ inputs.docker_sensitive_paths }}
         run: |
-          docker build -t secops-candidate:scan .
-          docker run -d --name secops-probe -p 18080:8080 -e PORT=8080 secops-candidate:scan
-          for _ in 1 2 3 4 5 6; do
-            CODE_ROOT=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:18080/ || true)
-            if [[ "${CODE_ROOT}" != "000" ]]; then break; fi
-            sleep 1
-          done
-          for SENSITIVE in "/server.py" "/.env" "/Dockerfile"; do
-            SCODE=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${SENSITIVE}" || true)
-            if [[ "${SCODE}" == "200" ]]; then
-              docker rm -f secops-probe
-              echo "::error::容器安全檢測失敗：敏感路徑 ${SENSITIVE} 對外回傳 HTTP 200！"
+          trap 'docker rm -f secops-probe >/dev/null 2>&1 || true' EXIT
+
+          ENV_ITEM_RE='^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_./:@+-]*$'
+          PATH_ITEM_RE='^/[A-Za-z0-9_./-]*$'
+
+          if [[ ! "${DOCKER_PROBE_PATH}" =~ ${PATH_ITEM_RE} ]]; then
+            echo "::error::docker_probe_path 格式不合法: ${DOCKER_PROBE_PATH}"
+            exit 1
+          fi
+
+          DOCKER_ENV_ARGS=()
+          if [[ -n "${DOCKER_RUN_ENV}" ]]; then
+            if [[ "${DOCKER_RUN_ENV}" == *$'\n'* || "${DOCKER_RUN_ENV}" == *$'\r'* || "${DOCKER_RUN_ENV}" == ,* || "${DOCKER_RUN_ENV}" == *, || "${DOCKER_RUN_ENV}" == *,,* ]]; then
+              echo "::error::docker_run_env 不得包含換行或空白逗號項目"
+              exit 1
+            fi
+            IFS=',' read -r -a RAW_ENV_ITEMS <<< "${DOCKER_RUN_ENV}"
+            for item in "${RAW_ENV_ITEMS[@]}"; do
+              if [[ ! "${item}" =~ ${ENV_ITEM_RE} ]]; then
+                echo "::error::docker_run_env 項目不合法（僅允許 KEY=VALUE 正向白名單字元）: ${item}"
+                exit 1
+              fi
+              DOCKER_ENV_ARGS+=("-e" "${item}")
+            done
+          fi
+
+          if [[ -z "${DOCKER_SENSITIVE_PATHS}" || "${DOCKER_SENSITIVE_PATHS}" == *$'\n'* || "${DOCKER_SENSITIVE_PATHS}" == *$'\r'* || "${DOCKER_SENSITIVE_PATHS}" == ,* || "${DOCKER_SENSITIVE_PATHS}" == *, || "${DOCKER_SENSITIVE_PATHS}" == *,,* ]]; then
+            echo "::error::docker_sensitive_paths 格式不合法"
+            exit 1
+          fi
+          IFS=',' read -r -a SENSITIVE_PATHS <<< "${DOCKER_SENSITIVE_PATHS}"
+          for sp in "${SENSITIVE_PATHS[@]}"; do
+            if [[ ! "${sp}" =~ ${PATH_ITEM_RE} ]]; then
+              echo "::error::docker_sensitive_paths 路徑不合法: ${sp}"
               exit 1
             fi
           done
-          docker rm -f secops-probe
-          echo "[PASS] Container runtime probe passed (/server.py, /.env, /Dockerfile blocked)."
+
+          docker build -t secops-candidate:scan .
+          docker run -d --name secops-probe -p 18080:8080 -e PORT=8080 ${DOCKER_ENV_ARGS[@]+"${DOCKER_ENV_ARGS[@]}"} secops-candidate:scan
+
+          CODE_ROOT="000"
+          for _ in $(seq 1 15); do
+            RUNNING=$(docker inspect -f '{{.State.Running}}' secops-probe 2>/dev/null || echo "false")
+            if [[ "${RUNNING}" != "true" ]]; then
+              echo "::error::容器安全檢測失敗：secops-probe 啟動後即異常終止！"
+              docker logs secops-probe || true
+              exit 1
+            fi
+            CODE_ROOT=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${DOCKER_PROBE_PATH}" || echo "000")
+            if [[ "${CODE_ROOT}" != "000" ]]; then break; fi
+            sleep 1
+          done
+
+          if [[ "${CODE_ROOT}" == "000" || "${CODE_ROOT}" =~ ^5[0-9]{2}$ ]]; then
+            echo "::error::容器安全檢測失敗：探測 ${DOCKER_PROBE_PATH} 回傳異常狀態碼 HTTP ${CODE_ROOT}！"
+            docker logs secops-probe || true
+            exit 1
+          fi
+          if [[ "${DOCKER_PROBE_PATH}" != "/" && "${CODE_ROOT}" != "200" ]]; then
+            echo "::error::容器安全檢測失敗：自訂健康探測路徑 ${DOCKER_PROBE_PATH} 預期 HTTP 200，實際為 HTTP ${CODE_ROOT}！"
+            docker logs secops-probe || true
+            exit 1
+          fi
+
+          for SENSITIVE in "${SENSITIVE_PATHS[@]}"; do
+            SCODE=$(curl -s --connect-timeout 2 --max-time 3 -o /dev/null -w "%{http_code}" "http://127.0.0.1:18080${SENSITIVE}" || echo "000")
+            if [[ "${SCODE}" == "200" || "${SCODE}" == "000" || "${SCODE}" =~ ^5[0-9]{2}$ ]]; then
+              echo "::error::容器安全檢測失敗：敏感路徑 ${SENSITIVE} 回傳非預期狀態碼 HTTP ${SCODE}！"
+              docker logs secops-probe || true
+              exit 1
+            fi
+          done
+          echo "[PASS] Container runtime probe passed (${DOCKER_PROBE_PATH} -> HTTP ${CODE_ROOT}; blocked: ${DOCKER_SENSITIVE_PATHS})."
 
       - name: Stage 3c — Aqua Trivy Container Vulnerability Scan
         if: ${{ inputs.docker_scan }}
