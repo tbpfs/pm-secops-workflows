@@ -50,6 +50,20 @@ class TestSecOpsGate(unittest.TestCase):
         subprocess.run(["git", "add", "."], cwd=self.tmpdir, check=True)
         self.assertEqual(pm_secops_gate.scan_repository(self.tmpdir), [])
 
+    def test_reusable_secops_efficiency_and_supply_chain_contract(self) -> None:
+        wf_path = REPO_ROOT / ".github" / "workflows" / "reusable-secops.yml"
+        txt = wf_path.read_text(encoding="utf-8")
+        self.assertIn("install_ffmpeg:", txt)
+        self.assertIn('INSTALL_FFMPEG: ${{ inputs.install_ffmpeg', txt)
+        self.assertIn('if [[ "${INSTALL_FFMPEG}" == "1" ]]', txt)
+        self.assertIn("actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9", txt)
+        self.assertIn("cache: true", txt)
+        self.assertIn("persist-credentials: false", txt)
+        self.assertEqual(
+            pm_secops_gate.scan_repository(REPO_ROOT, is_public_repo=True),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

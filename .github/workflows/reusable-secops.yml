@@ -38,6 +38,11 @@ on:
         required: false
         type: string
         default: ""
+      install_ffmpeg:
+        description: "執行測試前是否安裝 ffmpeg（預設關閉，僅需音訊解碼測試之專案開啟）"
+        required: false
+        type: boolean
+        default: false
       docker_scan:
         description: "是否建置 Dockerfile 並執行 Trivy HIGH/CRITICAL 掃描與敏感路徑暴露黑盒測試"
         required: false
@@ -57,23 +62,43 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: caller
+          persist-credentials: false
 
       - name: Checkout shared secops scanner
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: tbpfs/pm-secops-workflows
           path: _secops
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
+      - name: Cache pip downloads (Bandit & Python requirements)
+        if: ${{ inputs.python_sast || inputs.test_command != '' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: secops-pip-v1-${{ runner.os }}-${{ hashFiles('caller/requirements.txt') || 'base' }}
+          restore-keys: |
+            secops-pip-v1-${{ runner.os }}-
+
       - name: Set up Node.js 24 (when needed)
         if: ${{ inputs.node_audit || contains(inputs.test_command, 'npm') || contains(inputs.test_command, 'node') }}
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
+
+      - name: Cache npm downloads (when needed)
+        if: ${{ inputs.node_audit || contains(inputs.test_command, 'npm') }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: secops-npm-v1-${{ runner.os }}-${{ hashFiles('caller/**/package-lock.json') || 'base' }}
+          restore-keys: |
+            secops-npm-v1-${{ runner.os }}-
 
       - name: Stage 1 — Secret, Path Leak & Workflow Supply-Chain Gate
         env:
@@ -113,12 +138,13 @@ jobs:
         working-directory: caller
         env:
           TEST_CMD: ${{ inputs.test_command }}
+          INSTALL_FFMPEG: ${{ inputs.install_ffmpeg && '1' || '0' }}
           IS_PUB_WEB: ${{ inputs.public_web_gate && '1' || '0' }}
           IS_PUB_REPO: ${{ inputs.public_repo && '1' || '0' }}
           ALLOW_LARGE: ${{ inputs.large_file_allowlist }}
         run: |
           if [[ -n "${TEST_CMD}" ]]; then
-            if ! command -v ffmpeg >/dev/null 2>&1; then
+            if [[ "${INSTALL_FFMPEG}" == "1" ]] && ! command -v ffmpeg >/dev/null 2>&1; then
               sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg
             fi
             if [[ -f requirements.txt ]]; then
@@ -167,3 +193,4 @@ jobs:
           ignore-unfixed: true
           vuln-type: "library"
           severity: "CRITICAL"
+          cache: true
